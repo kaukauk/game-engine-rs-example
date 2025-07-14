@@ -237,7 +237,7 @@ impl State {
             zfar: 100.0,
         };
 
-        let camera_controller = CameraController::new(0.2, 0.1);
+        let camera_controller = CameraController::new(0.02, 0.001);
 
         let mut uniforms = Uniforms::new();
         uniforms.view_proj =
