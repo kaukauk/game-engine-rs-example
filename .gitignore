@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target/
+
+# Backup files
+*.rs.bk
+
+# Windows-specific
+*.pdb
+
+# IDE configuration
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS-specific
+.DS_Store
+Thumbs.db 
