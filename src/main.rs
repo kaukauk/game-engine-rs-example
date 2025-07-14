@@ -1,11 +1,47 @@
 use cgmath::prelude::*;
-use std::time::Instant;
 use wgpu::util::DeviceExt;
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
+
+#[rustfmt::skip]
+pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 0.5, 0.0,
+    0.0, 0.0, 0.5, 1.0,
+);
+
+struct Camera {
+    eye: cgmath::Point3<f32>,
+    target: cgmath::Point3<f32>,
+    up: cgmath::Vector3<f32>,
+    aspect: f32,
+    fovy: f32,
+    znear: f32,
+    zfar: f32,
+}
+
+impl Camera {
+    fn build_view_projection_matrix(&self) -> cgmath::Matrix4<f32> {
+        let view = cgmath::Matrix4::look_at_rh(self.eye, self.target, self.up);
+        let proj = cgmath::perspective(cgmath::Deg(self.fovy), self.aspect, self.znear, self.zfar);
+        proj * view
+    }
+}
+
+struct CameraController {
+    speed: f32,
+    sensitivity: f32,
+}
+
+impl CameraController {
+    fn new(speed: f32, sensitivity: f32) -> Self {
+        Self { speed, sensitivity }
+    }
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -35,7 +71,7 @@ impl Vertex {
     }
 }
 
-const VERTICES: &[Vertex] = &[
+const CUBE_VERTICES: &[Vertex] = &[
     Vertex { position: [-0.5, -0.5, 0.5], color: [1.0, 0.0, 0.0] },
     Vertex { position: [0.5, -0.5, 0.5], color: [0.0, 1.0, 0.0] },
     Vertex { position: [0.5, 0.5, 0.5], color: [0.0, 0.0, 1.0] },
@@ -46,7 +82,7 @@ const VERTICES: &[Vertex] = &[
     Vertex { position: [-0.5, 0.5, -0.5], color: [0.5, 0.5, 0.5] },
 ];
 
-const INDICES: &[u16] = &[
+const CUBE_INDICES: &[u16] = &[
     0, 1, 2, 0, 2, 3, // Front
     1, 5, 6, 1, 6, 2, // Right
     5, 4, 7, 5, 7, 6, // Back
@@ -55,10 +91,41 @@ const INDICES: &[u16] = &[
     4, 5, 1, 4, 1, 0, // Bottom
 ];
 
+const PLANE_VERTICES: &[Vertex] = &[
+    Vertex {
+        position: [-10.0, -0.5, -10.0],
+        color: [0.3, 0.4, 0.3],
+    },
+    Vertex {
+        position: [10.0, -0.5, -10.0],
+        color: [0.3, 0.4, 0.3],
+    },
+    Vertex {
+        position: [10.0, -0.5, 10.0],
+        color: [0.3, 0.4, 0.3],
+    },
+    Vertex {
+        position: [-10.0, -0.5, 10.0],
+        color: [0.3, 0.4, 0.3],
+    },
+];
+
+const PLANE_INDICES: &[u16] = &[0, 1, 2, 0, 2, 3];
+
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
-    mvp: [[f32; 4]; 4],
+    view_proj: [[f32; 4]; 4],
+    model: [[f32; 4]; 4],
+}
+
+impl Uniforms {
+    fn new() -> Self {
+        Self {
+            view_proj: cgmath::Matrix4::identity().into(),
+            model: cgmath::Matrix4::identity().into(),
+        }
+    }
 }
 
 struct State {
@@ -68,16 +135,20 @@ struct State {
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
+    cube_vertex_buffer: wgpu::Buffer,
+    cube_index_buffer: wgpu::Buffer,
+    plane_vertex_buffer: wgpu::Buffer,
+    plane_index_buffer: wgpu::Buffer,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
-    start_time: Instant,
-    cube_pos: cgmath::Vector3<f32>,
+    camera: Camera,
+    camera_controller: CameraController,
+    static_cube_pos: cgmath::Vector3<f32>,
     is_w_pressed: bool,
     is_a_pressed: bool,
     is_s_pressed: bool,
     is_d_pressed: bool,
+    mouse_delta: (f32, f32),
 }
 
 impl State {
@@ -135,20 +206,43 @@ impl State {
         };
         surface.configure(&device, &config);
 
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(VERTICES),
+        let cube_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Cube Vertex Buffer"),
+            contents: bytemuck::cast_slice(CUBE_VERTICES),
             usage: wgpu::BufferUsages::VERTEX,
         });
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(INDICES),
+        let cube_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Cube Index Buffer"),
+            contents: bytemuck::cast_slice(CUBE_INDICES),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let plane_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Plane Vertex Buffer"),
+            contents: bytemuck::cast_slice(PLANE_VERTICES),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let plane_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Plane Index Buffer"),
+            contents: bytemuck::cast_slice(PLANE_INDICES),
             usage: wgpu::BufferUsages::INDEX,
         });
 
-        let uniforms = Uniforms {
-            mvp: cgmath::Matrix4::identity().into(),
+        let camera = Camera {
+            eye: (0.0, 1.0, 2.0).into(),
+            target: (0.0, 0.0, 0.0).into(),
+            up: cgmath::Vector3::unit_y(),
+            aspect: config.width as f32 / config.height as f32,
+            fovy: 45.0,
+            znear: 0.1,
+            zfar: 100.0,
         };
+
+        let camera_controller = CameraController::new(0.2, 0.1);
+
+        let mut uniforms = Uniforms::new();
+        uniforms.view_proj =
+            (OPENGL_TO_WGPU_MATRIX * camera.build_view_projection_matrix()).into();
+
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Uniform Buffer"),
             contents: bytemuck::cast_slice(&[uniforms]),
@@ -232,16 +326,20 @@ impl State {
             config,
             size,
             render_pipeline,
-            vertex_buffer,
-            index_buffer,
+            cube_vertex_buffer,
+            cube_index_buffer,
+            plane_vertex_buffer,
+            plane_index_buffer,
             uniform_buffer,
             uniform_bind_group,
-            start_time: Instant::now(),
-            cube_pos: cgmath::Vector3::new(0.0, 0.0, 0.0),
+            camera,
+            camera_controller,
+            static_cube_pos: cgmath::Vector3::new(3.0, 0.0, -3.0),
             is_w_pressed: false,
             is_a_pressed: false,
             is_s_pressed: false,
             is_d_pressed: false,
+            mouse_delta: (0.0, 0.0),
         }
     }
 
@@ -251,10 +349,11 @@ impl State {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
+            self.camera.aspect = self.config.width as f32 / self.config.height as f32;
         }
     }
 
-    fn input(&mut self, event: &WindowEvent) -> bool {
+    fn input(&mut self, event: &WindowEvent) {
         match event {
             WindowEvent::KeyboardInput {
                 input:
@@ -267,66 +366,49 @@ impl State {
             } => {
                 let is_pressed = *state == ElementState::Pressed;
                 match keycode {
-                    VirtualKeyCode::W => {
-                        self.is_w_pressed = is_pressed;
-                        true
-                    }
-                    VirtualKeyCode::A => {
-                        self.is_a_pressed = is_pressed;
-                        true
-                    }
-                    VirtualKeyCode::S => {
-                        self.is_s_pressed = is_pressed;
-                        true
-                    }
-                    VirtualKeyCode::D => {
-                        self.is_d_pressed = is_pressed;
-                        true
-                    }
-                    _ => false,
+                    VirtualKeyCode::W => self.is_w_pressed = is_pressed,
+                    VirtualKeyCode::A => self.is_a_pressed = is_pressed,
+                    VirtualKeyCode::S => self.is_s_pressed = is_pressed,
+                    VirtualKeyCode::D => self.is_d_pressed = is_pressed,
+                    _ => {}
                 }
             }
-            _ => false,
+            _ => {}
         }
     }
 
     fn update(&mut self) {
-        let speed = 0.1;
+        let forward = (self.camera.target - self.camera.eye).normalize();
+        let right = forward.cross(self.camera.up);
+
         if self.is_w_pressed {
-            self.cube_pos.z -= speed;
+            self.camera.eye += forward * self.camera_controller.speed;
         }
         if self.is_s_pressed {
-            self.cube_pos.z += speed;
-        }
-        if self.is_a_pressed {
-            self.cube_pos.x -= speed;
+            self.camera.eye -= forward * self.camera_controller.speed;
         }
         if self.is_d_pressed {
-            self.cube_pos.x += speed;
+            self.camera.eye += right * self.camera_controller.speed;
+        }
+        if self.is_a_pressed {
+            self.camera.eye -= right * self.camera_controller.speed;
         }
 
-        let elapsed = self.start_time.elapsed().as_secs_f32();
-        let angle = elapsed * 1.0;
-        let rotation = cgmath::Matrix4::from_angle_y(cgmath::Rad(angle))
-            * cgmath::Matrix4::from_angle_x(cgmath::Rad(angle * 0.5));
-        
-        let translation = cgmath::Matrix4::from_translation(self.cube_pos);
-        let model = translation * rotation;
-        
-        let view = cgmath::Matrix4::look_at_rh(
-            cgmath::Point3::new(1.5, 1.5, 2.5),
-            cgmath::Point3::new(0.0, 0.0, 0.0),
-            cgmath::Vector3::unit_y(),
+        let (yaw, pitch) = (
+            self.mouse_delta.0 * self.camera_controller.sensitivity,
+            self.mouse_delta.1 * self.camera_controller.sensitivity,
         );
-        let proj = cgmath::perspective(
-            cgmath::Deg(45.0),
-            self.config.width as f32 / self.config.height as f32,
-            0.1,
-            100.0,
-        );
-        let mvp = proj * view * model;
+        self.mouse_delta = (0.0, 0.0);
 
-        let uniforms = Uniforms { mvp: mvp.into() };
+        let new_forward = cgmath::Matrix3::from_axis_angle(self.camera.up, cgmath::Rad(-yaw))
+            * cgmath::Matrix3::from_axis_angle(right, cgmath::Rad(-pitch))
+            * forward;
+
+        self.camera.target = self.camera.eye + new_forward;
+
+        let mut uniforms = Uniforms::new();
+        uniforms.view_proj =
+            (OPENGL_TO_WGPU_MATRIX * self.camera.build_view_projection_matrix()).into();
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
     }
@@ -363,16 +445,38 @@ impl State {
 
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+
+            // Draw the plane
+            let model = cgmath::Matrix4::from_translation(cgmath::Vector3::new(0.0, 0.0, 0.0));
+            self.update_model(model);
+            render_pass.set_vertex_buffer(0, self.plane_vertex_buffer.slice(..));
             render_pass
-                .set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            render_pass.draw_indexed(0..INDICES.len() as u32, 0, 0..1);
+                .set_index_buffer(self.plane_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.draw_indexed(0..PLANE_INDICES.len() as u32, 0, 0..1);
+
+            // Draw the static cube
+            let model = cgmath::Matrix4::from_translation(self.static_cube_pos);
+            self.update_model(model);
+            render_pass.set_vertex_buffer(0, self.cube_vertex_buffer.slice(..));
+            render_pass
+                .set_index_buffer(self.cube_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.draw_indexed(0..CUBE_INDICES.len() as u32, 0, 0..1);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
 
         Ok(())
+    }
+
+    fn update_model(&self, model: cgmath::Matrix4<f32>) {
+        let mut uniforms = Uniforms::new();
+        uniforms.model = model.into();
+        self.queue.write_buffer(
+            &self.uniform_buffer,
+            64,
+            bytemuck::cast_slice(&[uniforms.model]),
+        );
     }
 }
 
@@ -381,28 +485,37 @@ async fn main() {
     env_logger::init();
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
-        .with_title("Movable Cube")
+        .with_title("First-Person Player")
         .build(&event_loop)
         .unwrap();
     let mut state = State::new(&window).await;
+    window.set_cursor_grab(winit::window::CursorGrabMode::Confined).unwrap();
+    window.set_cursor_visible(false);
+
 
     event_loop.run(move |event, _, control_flow| {
         match event {
+            Event::DeviceEvent {
+                event: DeviceEvent::MouseMotion { delta },
+                ..
+            } => {
+                state.mouse_delta.0 += delta.0 as f32;
+                state.mouse_delta.1 += delta.1 as f32;
+            }
             Event::WindowEvent {
                 ref event,
                 window_id,
             } if window_id == window.id() => {
-                if !state.input(event) {
-                    match event {
-                        WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
-                        WindowEvent::Resized(physical_size) => {
-                            state.resize(*physical_size);
-                        }
-                        WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
-                            state.resize(**new_inner_size);
-                        }
-                        _ => {}
+                state.input(event);
+                match event {
+                    WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+                    WindowEvent::Resized(physical_size) => {
+                        state.resize(*physical_size);
                     }
+                    WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
+                        state.resize(**new_inner_size);
+                    }
+                    _ => {}
                 }
             }
             Event::RedrawRequested(window_id) if window_id == window.id() => {
